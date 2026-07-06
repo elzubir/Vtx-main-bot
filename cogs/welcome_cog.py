@@ -4,7 +4,7 @@ import logging
 import os
 import traceback
 from datetime import datetime, timezone
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 
 import discord
 from discord import app_commands
@@ -197,6 +197,149 @@ class GatePreviewView(discord.ui.View):
 
 
 # -----------------------
+# Message panel UI
+# -----------------------
+class _ChannelSelect(discord.ui.Select):
+    def __init__(self, channels: List[discord.TextChannel], placeholder: str = "Choose a channel..."):
+        options = [discord.SelectOption(label=c.name, value=str(c.id), description=f"#{c.name}") for c in channels[:25]]
+        super().__init__(placeholder=placeholder, min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: MessagePanelView = self.view  # type: ignore
+        view.selected_channel_id = int(self.values[0])
+        await interaction.response.defer(ephemeral=True)
+
+
+class _RoleSelect(discord.ui.Select):
+    def __init__(self, roles: List[discord.Role], placeholder: str = "Choose a role (optional)..."):
+        options = [discord.SelectOption(label=r.name, value=str(r.id), description=f"@{r.name}") for r in roles[:25] if not r.is_default()]
+        if not options:
+            options = [discord.SelectOption(label="No roles available", value="0", description="", default=True)]
+            super().__init__(placeholder=placeholder, min_values=0, max_values=0, options=options, disabled=True)
+        else:
+            super().__init__(placeholder=placeholder, min_values=0, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: MessagePanelView = self.view  # type: ignore
+        if self.values:
+            view.selected_role_id = int(self.values[0])
+        else:
+            view.selected_role_id = None
+        await interaction.response.defer(ephemeral=True)
+
+
+class EmbedModal(discord.ui.Modal, title="Send Embed Message"):
+    title_input = discord.ui.TextInput(label="Title", required=True, max_length=256)
+    description_input = discord.ui.TextInput(label="Description", style=discord.TextStyle.paragraph, required=True, max_length=4000)
+
+    def __init__(self, view: 'MessagePanelView'):
+        super().__init__()
+        self.view = view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        view = self.view
+        if not view.selected_channel_id:
+            await interaction.response.send_message(embed=build_embed("⛔ No channel selected", "Please select a channel first.", error=True, ctx=interaction), ephemeral=True)
+            return
+        channel = view.guild.get_channel(view.selected_channel_id)
+        if channel is None:
+            await interaction.response.send_message(embed=build_embed("⛔ Channel not found", "The selected channel could not be found.", error=True, ctx=interaction), ephemeral=True)
+            return
+        embed = discord.Embed(title=self.title_input.value, description=self.description_input.value, color=EMBED_COLOR, timestamp=discord.utils.utcnow())
+        # small UI-like separator using a field (since discord.ui.separator doesn't exist)
+        embed.add_field(name="", value="", inline=False)
+        if view.selected_role_id:
+            role = view.guild.get_role(view.selected_role_id)
+            if role:
+                embed.add_field(name="Mention", value=role.mention, inline=False)
+        try:
+            embed.set_footer(text=f"Sent by {view.invoker}", icon_url=view.invoker.display_avatar.url)
+        except Exception:
+            embed.set_footer(text=f"Sent by {view.invoker}")
+        try:
+            await channel.send(embed=embed)
+            await interaction.response.send_message(embed=build_embed("✅ Embed sent", f"Embed message sent to <#{channel.id}>", success=True, ctx=interaction), ephemeral=True)
+        except Exception as exc:
+            log.exception("Failed to send embed from panel: %s", exc)
+            await interaction.response.send_message(embed=build_embed("Failed to send", "Could not deliver the embed message.", error=True, ctx=interaction), ephemeral=True)
+
+
+class NormalModal(discord.ui.Modal, title="Send Plain Message"):
+    content_input = discord.ui.TextInput(label="Message content", style=discord.TextStyle.paragraph, required=True, max_length=2000)
+
+    def __init__(self, view: 'MessagePanelView'):
+        super().__init__()
+        self.view = view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        view = self.view
+        if not view.selected_channel_id:
+            await interaction.response.send_message(embed=build_embed("⛔ No channel selected", "Please select a channel first.", error=True, ctx=interaction), ephemeral=True)
+            return
+        channel = view.guild.get_channel(view.selected_channel_id)
+        if channel is None:
+            await interaction.response.send_message(embed=build_embed("⛔ Channel not found", "The selected channel could not be found.", error=True, ctx=interaction), ephemeral=True)
+            return
+        content = self.content_input.value
+        footer = f"\n\n— Sent by {view.invoker}"
+        if view.selected_role_id:
+            role = view.guild.get_role(view.selected_role_id)
+            if role:
+                content = f"{role.mention} {content}"
+        try:
+            await channel.send(content + footer)
+            await interaction.response.send_message(embed=build_embed("✅ Message sent", f"Message sent to <#{channel.id}>", success=True, ctx=interaction), ephemeral=True)
+        except Exception as exc:
+            log.exception("Failed to send plain message from panel: %s", exc)
+            await interaction.response.send_message(embed=build_embed("Failed to send", "Could not deliver the plain message.", error=True, ctx=interaction), ephemeral=True)
+
+
+class MessagePanelView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, invoker: discord.User):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.invoker = invoker
+        self.selected_channel_id: Optional[int] = None
+        self.selected_role_id: Optional[int] = None
+
+        # populate channel select with text channels
+        text_channels = [c for c in guild.channels if isinstance(c, discord.TextChannel)]
+        if text_channels:
+            self.add_item(_ChannelSelect(text_channels))
+
+        # populate role select
+        roles = [r for r in guild.roles if not r.is_default()]
+        if roles:
+            self.add_item(_RoleSelect(roles))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker.id:
+            await interaction.response.send_message("⛔ This panel belongs to someone else.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Embed message", style=discord.ButtonStyle.primary, row=2)
+    async def embed_message(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Open modal to gather embed title/description
+        await interaction.response.send_modal(EmbedModal(self))
+
+    @discord.ui.button(label="Normal message", style=discord.ButtonStyle.secondary, row=2)
+    async def normal_message(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Open modal to gather plain text message
+        await interaction.response.send_modal(NormalModal(self))
+
+    @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, row=3)
+    async def close_panel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+        try:
+            await interaction.response.edit_message(view=self)
+        except Exception:
+            pass
+
+
+# -----------------------
 # Cog
 # -----------------------
 class WelcomeCog(commands.Cog, name="Welcome/Leave"):
@@ -279,6 +422,21 @@ class WelcomeCog(commands.Cog, name="Welcome/Leave"):
         view = GatePreviewView(member, ctx.guild, ctx.author)
         e = build_embed("Preview Gate Embeds", "Use the buttons to send sample welcome/leave embeds.", ctx=ctx)
         await ctx.send(embed=e, view=view)
+
+    # New: Panel to send messages (embed or normal) via UI
+    @command_error_reporter
+    @commands.hybrid_command(name="messagepanel", description="Open a panel to send an embed or normal message via the bot.")
+    @commands.has_guild_permissions(manage_guild=True)
+    async def messagepanel(self, ctx: commands.Context):
+        view = MessagePanelView(ctx.guild, ctx.author)
+        # Build the embedded panel message (buttons live in the view)
+        desc = "Use the selects to choose a channel and optionally a role.\nThen use the buttons below to send an embed or a normal message.\n\nNote: the footer of sent messages will show who sent them."
+        embed = discord.Embed(title="Message Panel", description=desc, color=EMBED_COLOR, timestamp=discord.utils.utcnow())
+        try:
+            embed.set_footer(text=f"Panel opened by {ctx.author}", icon_url=ctx.author.display_avatar.url)
+        except Exception:
+            embed.set_footer(text=f"Panel opened by {ctx.author}")
+        await ctx.send(embed=embed, view=view)
 
     # Events
     @command_error_reporter
